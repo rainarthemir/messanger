@@ -3,52 +3,75 @@ import { WebSocketServer } from 'ws';
 const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
 const rooms = new Map();
 
-console.log('Chat server running');
+console.log('Chat server with nicknames and custom room IDs');
 
 wss.on('connection', (ws) => {
   let currentRoom = null;
+  let myNick = null;
 
   ws.on('message', (raw) => {
     const msg = JSON.parse(raw.toString());
     
     if (msg.type === 'create') {
-      const roomId = Math.random().toString(36).slice(2, 8);
-      rooms.set(roomId, [ws]);
+      let roomId = msg.roomId;
+      if (!roomId) {
+        roomId = Math.random().toString(36).slice(2, 8);
+      } else {
+        if (rooms.has(roomId)) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Room ID already exists' }));
+          return;
+        }
+        if (!/^[a-zA-Z0-9\-_]+$/.test(roomId)) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Invalid room ID' }));
+          return;
+        }
+      }
+      rooms.set(roomId, { clients: new Set([ws]), nicknames: new Map() });
       currentRoom = roomId;
-      ws.send(JSON.stringify({ type: 'created', roomId }));
-      console.log('Room created:', roomId);
+      myNick = msg.nick || 'Anonymous';
+      rooms.get(roomId).nicknames.set(ws, myNick);
+      ws.send(JSON.stringify({ type: 'created', roomId, nick: myNick }));
+      console.log(`Room ${roomId} created by ${myNick}`);
       
     } else if (msg.type === 'join') {
-      const room = rooms.get(msg.roomId);
-      if (room && room.length < 2) {
-        room.push(ws);
-        currentRoom = msg.roomId;
-        ws.send(JSON.stringify({ type: 'joined', roomId: msg.roomId }));
-        
-        // Сообщаем первому пользователю, что кто-то зашёл
-        if (room[0] && room[0] !== ws) {
-          room[0].send(JSON.stringify({ type: 'peer_joined' }));
-        }
-        console.log('User joined room:', msg.roomId);
-      } else {
-        ws.send(JSON.stringify({ type: 'error', message: 'Room is full or not exists' }));
+      const roomId = msg.roomId;
+      const room = rooms.get(roomId);
+      if (!room) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Room not found' }));
+        return;
       }
+      if (room.clients.size >= 2) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Room is full' }));
+        return;
+      }
+      room.clients.add(ws);
+      myNick = msg.nick || 'Anonymous';
+      room.nicknames.set(ws, myNick);
+      currentRoom = roomId;
+      ws.send(JSON.stringify({ type: 'joined', roomId, nick: myNick }));
+      
+      const other = [...room.clients].find(c => c !== ws);
+      if (other && other.readyState === 1) {
+        other.send(JSON.stringify({ type: 'peer_joined', nick: myNick }));
+        const firstNick = room.nicknames.get(other);
+        ws.send(JSON.stringify({ type: 'peer_info', nick: firstNick }));
+      }
+      console.log(`${myNick} joined ${roomId}`);
       
     } else if (msg.type === 'message') {
-      // Пересылаем сообщение другому участнику комнаты
+      if (!currentRoom) return;
       const room = rooms.get(currentRoom);
-      if (room) {
-        const other = room.find(client => client !== ws);
-        if (other && other.readyState === 1) {
-          other.send(JSON.stringify({ 
-            type: 'message', 
-            text: msg.text,
-            from: msg.from || 'friend'
-          }));
-          console.log('Message relayed in room:', currentRoom);
-        } else {
-          ws.send(JSON.stringify({ type: 'error', message: 'Peer disconnected' }));
-        }
+      if (!room) return;
+      const other = [...room.clients].find(c => c !== ws);
+      if (other && other.readyState === 1) {
+        other.send(JSON.stringify({
+          type: 'message',
+          text: msg.text,
+          nick: myNick,
+          timestamp: Date.now()
+        }));
+      } else {
+        ws.send(JSON.stringify({ type: 'error', message: 'Peer disconnected' }));
       }
     }
   });
@@ -57,15 +80,14 @@ wss.on('connection', (ws) => {
     if (currentRoom) {
       const room = rooms.get(currentRoom);
       if (room) {
-        const remaining = room.filter(client => client !== ws);
-        if (remaining.length === 0) {
+        room.clients.delete(ws);
+        room.nicknames.delete(ws);
+        if (room.clients.size === 0) {
           rooms.delete(currentRoom);
-          console.log('Room deleted:', currentRoom);
         } else {
-          rooms.set(currentRoom, remaining);
-          // Сообщаем оставшемуся, что собеседник ушёл
-          if (remaining[0] && remaining[0].readyState === 1) {
-            remaining[0].send(JSON.stringify({ type: 'peer_left' }));
+          const remaining = [...room.clients][0];
+          if (remaining && remaining.readyState === 1) {
+            remaining.send(JSON.stringify({ type: 'peer_left' }));
           }
         }
       }
